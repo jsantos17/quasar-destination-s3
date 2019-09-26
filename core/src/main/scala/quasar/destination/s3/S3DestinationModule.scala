@@ -21,12 +21,18 @@ import slamdata.Predef._
 import quasar.api.destination.DestinationError
 import quasar.api.destination.DestinationError.InitializationError
 import quasar.api.destination.{Destination, DestinationType}
+import quasar.concurrent.NamedDaemonThreadFactory
 import quasar.connector.{DestinationModule, MonadResourceErr}
 import quasar.destination.s3.impl.DefaultUpload
 
-import scala.util.Either
+import java.lang.Runtime
+import java.util.concurrent.Executors
 
 import argonaut.{Argonaut, Json}, Argonaut._
+import software.amazon.awssdk.core.client.config.{
+  ClientAsyncConfiguration,
+  SdkAdvancedAsyncClientOption
+}
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
 import software.amazon.awssdk.services.s3.S3AsyncClient
@@ -43,6 +49,7 @@ import cats.instances.int._
 import cats.syntax.applicativeError._
 import cats.syntax.either._
 import cats.syntax.functor._
+import cats.syntax.flatMap._
 import eu.timepit.refined.auto._
 import monix.catnap.syntax._
 import scalaz.NonEmptyList
@@ -52,6 +59,7 @@ object S3DestinationModule extends DestinationModule {
   private val PartSize = 10 * 1024 * 1024
   private val Redacted = "<REDACTED>"
   private val RedactedCreds = S3Credentials(AccessKey(Redacted), SecretKey(Redacted), Region(Redacted))
+  private val AsyncPoolPrefix = "s3-async-dest"
 
   def destinationType = DestinationType("s3", 1L)
 
@@ -98,18 +106,29 @@ object S3DestinationModule extends DestinationModule {
       }
 
   private def mkClient[F[_]: Sync](cfg: S3Config): Resource[F, S3AsyncClient] = {
-    val client =
-      Sync[F].delay(
-        S3AsyncClient
-          .builder
-          .credentialsProvider(
-            StaticCredentialsProvider.create(
-              AwsBasicCredentials.create(
-                cfg.credentials.accessKey.value,
-                cfg.credentials.secretKey.value)))
-          .region(AwsRegion.of(cfg.credentials.region.value))
-          .build)
+    val allocateExecutor =
+      Sync[F].delay(Runtime.getRuntime.availableProcessors).flatMap(cores =>
+        Sync[F].delay(Executors.newFixedThreadPool(cores, NamedDaemonThreadFactory(AsyncPoolPrefix))))
 
-    Resource.fromAutoCloseable[F, S3AsyncClient](client)
+    val executorService =
+      Resource.make(allocateExecutor)(es => Sync[F].delay(es.shutdown()))
+
+    executorService.flatMap(es =>
+      Resource.fromAutoCloseable(
+        Sync[F].delay(
+          S3AsyncClient
+            .builder
+            .asyncConfiguration(
+              ClientAsyncConfiguration
+                .builder
+                .advancedOption(SdkAdvancedAsyncClientOption.FUTURE_COMPLETION_EXECUTOR, es)
+                .build)
+            .credentialsProvider(
+              StaticCredentialsProvider.create(
+                AwsBasicCredentials.create(
+                  cfg.credentials.accessKey.value,
+                  cfg.credentials.secretKey.value)))
+            .region(AwsRegion.of(cfg.credentials.region.value))
+            .build)))
   }
 }
